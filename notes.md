@@ -448,3 +448,59 @@ search = TavilySearch(max_results=5)          # reads TAVILY_API_KEY from env
 **Maps onto the 4 moves:** Worker = steps 1–4 (build the tooled-up model) · Post-it = step 5 (HumanMessage) · Box = step 6 (invoke) · Read = step 7 (print).
 
 **What can be omitted:** [2] if no tools needed, [3] if no persona needed — the skeleton still holds.
+
+---
+
+# Memory & the stateless model (Module 1.3)
+
+## The #1 principle
+> **The model NEVER remembers anything.** It's a stateless function: `model.invoke(conversation_text) → reply_text`. Between calls nothing persists inside it. **"Memory" = the history being re-sent to the API on every turn.**
+
+## Why an agent "forgets"
+- The agent is a **graph** whose **state** = the `messages` list.
+- Each `invoke({"messages": [...]})` starts from the messages *you* provide; when the run ends the state is returned — **and discarded unless saved**.
+- Next `invoke` starts from scratch → model sees only your new message → honestly answers *"I don't know"*.
+
+## What changes under the hood to make it remember
+Two ingredients: a **checkpointer** (storage) + a **`thread_id`** (address).
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+agent = create_agent(model=model, checkpointer=InMemorySaver())
+config = {"configurable": {"thread_id": "1"}}     # same key = same conversation
+```
+
+Every invoke now runs: **LOAD → APPEND → RUN → SAVE**
+
+```
+run 1: no saved state → [Human("Seán, green")] → model replies → SAVE under "1"
+run 2: LOAD "1" → [Human, AI] → append new msg → model sees FULL transcript
+       → remembers green ✅ → SAVE again (now longer)
+```
+
+| | No checkpointer | Checkpointer + thread_id |
+|---|---|---|
+| starting state of next run | fresh (`[Human(new)]`) | loaded (`[Human, AI, Human(new)]`) |
+| what model sees | only your new message | the full previous transcript |
+| state after run | discarded | saved under the thread key |
+| verdict | forgets ❌ | remembers ✅ |
+
+**The model changed in NOTHING** — only what text got prepended.
+
+## What a thread is
+- The checkpointer snapshots state after every graph step, keyed by `thread_id` (a **chain of checkpoints**, like git commits, each with `checkpoint_id`).
+- Same `thread_id` = same drawer = remembers. Different `thread_id` = different drawer = separate conversation (each user = own thread).
+- Lifecycle: *checkpointer = storage, `thread_id` = the address; address matters as much as storage — a key you never use again is a drawer you can never open.*
+
+## The cost (and why memory isn't free)
+- Every turn **re-sends the whole history** → tokens grow (real example: input_tokens 52 → 115 → 1894 once results arrived).
+- Consequence: context-window limits → real apps trim/summarize old messages.
+- `usage_metadata` per AI message is the receipt of that cost.
+
+## "How to solve it" in general (the 4 memory strategies)
+1. **Manually keep the list** (plain chat notebooks): you append every message and keep passing the list — works, full control.
+2. **Checkpointer (the agent way):** graph state auto-saved under `thread_id` — automatic history persistence (Module 1.3).
+3. **Short-term vs long-term:** short-term = message history within a thread; long-term = a memory store (vector DB of past facts) the agent retrieves when relevant.
+4. **Compression:** summarize/trim old messages when the thread grows — trade fidelity for context space.
+
+> One-liner: *the notebook's chat list, the agent's checkpointer, and a vector memory store are all the same trick — get the relevant history back IN FRONT of the model before it answers.*
