@@ -3,6 +3,37 @@
 > The mental model for LangChain course Module 1 (foundational models + prompting).
 > One goal: **control the model's answer**.
 
+## Table of Contents (table des matières)
+
+1. **Chatbot vs RAG vs Agentic vs Corrective RAG** — the 4 knowledge concepts (below)
+2. The Master Map — 5 layers of control
+3. The 4 moves (Worker / Post-it / Box / Read) — the execution skeleton
+4. The 5 cages of prompting
+5. The 2 doors of the system prompt
+6. Structured output
+7. Tools & Invocation (Module 2 preview)
+8. How tools reach the model (the catalog)
+9. The 7-step agent recipe
+10. Mental model: `invoke` is a waiter (the tape & hidden loop)
+11. LangChain × providers: string guessing vs. explicit pinning (AI Studio fix)
+12. Tavily: ready-made tool vs. build your own
+
+## Chatbot vs RAG vs Agentic vs Corrective RAG
+
+> *Chatbot **knows** (memory) · RAG **fetches** (your files) · Agent **decides** (tools) · Corrective RAG **fetches, then if unsure — searches**.*
+
+| Concept | Where the answer's knowledge comes from | Who controls "what happens next" |
+|---|---|---|
+| **Chatbot (plain LLM)** | the model's **training weights** — frozen at cutoff | nobody — one answer |
+| **RAG** | **your external corpus** (retrieved chunks stuffed into the prompt) | a **fixed pipeline** (retrieve → stuff → answer), not the model |
+| **Agentic** | wherever tools fetch from (any tool's output) | the **model** — it decides which tool to call, in a loop |
+| **Corrective RAG** (= agentic RAG) | **your index first; web fallback if the model thinks retrieval failed** | the **model** — it self-repairs a weak retrieval by calling `web_search` |
+
+- **Chatbot**: answers from the data the LLM was trained on.
+- **RAG**: retrieving from external data (your vector DB) and grounding the answer in it.
+- **Agentic**: using tools — the model decides when/what to call (the `tool_calls` loop).
+- **Corrective RAG**: retrieve first; if the index can't answer, go fetch from the web.
+
 ## The Master Map
 
 ```
@@ -356,3 +387,64 @@ return {"messages": messages}
 - `tool_calls` = the model's order form: `[{name, args, id, type:'tool_call'}]`.
 - `ToolMessage.tool_call_id` matches the AIMessage's `id` → links result to request.
 - `.content` forms: plain `str` (Human/Tool) · `[]` (AI round 1) · `[{'type':'text','text':...}]` block-list (Gemini AI round 2) → final answer = `response["messages"][-1].content[0]["text"]` or `.text`.
+
+---
+
+# Tavily: ready-made tool vs. build your own
+
+**Same backend, different packaging.** Both call Tavily's real web API and need your `TAVILY_API_KEY` (in `.env`). The API never disappears — only the boilerplate does.
+
+| | `tavily.TavilyClient` (course, DIY) | `langchain_tavily.TavilySearch` (ready-made) |
+|---|---|---|
+| What it is | raw **HTTP client** for the Tavily API | raw client + **`@tool` wrapping done by the library** |
+| Tool name | none — you write it | built-in (name + description + args schema) |
+| Args schema | you write docstring + type hints | `{"query": "..."}` predefined |
+| Goes in `tools=[...]` directly? | ❌ must `@tool`-wrap it first | ✅ drop-in |
+| Output | raw dict `{query, results:[{url,title,content}...], answer}` | normalized string, LLM-friendly |
+| Pros | full control + teaches you `@tool` | zero boilerplate, official |
+
+**The two code shapes (identical result):**
+
+```python
+# DIY — you build the tool yourself (course cell 7)
+from tavily import TavilyClient
+from langchain.tools import tool
+from typing import Dict, Any
+
+tavily_client = TavilyClient()
+@tool
+def web_search(query: str) -> Dict[str, Any]:
+    """Search the web for information"""
+    return tavily_client.search(query)
+
+# Ready-made — the library already wrapped it as a tool
+from langchain_tavily import TavilySearch
+search = TavilySearch(max_results=5)          # reads TAVILY_API_KEY from env
+```
+
+**Notes:**
+- Import path in installed v0.2.18: `from langchain_tavily import TavilySearch` (NOT `langchain_tavily.tool` — that submodule doesn't exist here).
+- `langchain-tavily` is the **new** official integration, replacing the deprecated `langchain_community.tools.TavilySearchResults`. Newer ≠ key-free: it's still Tavily's API under the hood.
+- Test standalone like any tool: `search.invoke({"query": "Who is the current mayor of San Francisco?"})`.
+- Use in agent: `agent = create_agent(model=..., tools=[search], ...)` — same list slot as `tool1`.
+
+---
+
+# The 7-step agent recipe (always this order)
+
+```
+1. DETERMINE the model           → model = init_chat_model(model="...", model_provider="google-genai", api_key=...)
+2. DETERMINE the tool (optional) → @tool def search_web(...)        (or TavilySearch(max_results=5))
+3. DETERMINE the system prompt   → the character/instructions (optional)
+4. CREATE the agent              → agent = create_agent(model=..., tools=[...], system_prompt=...)
+      └─ the agent is the "worker + instruction sheet + toolbox" COMBINED
+5. DETERMINE the user's message  → question = HumanMessage("...")
+6. INVOKE the agent              → response = agent.invoke({"messages": [question]})
+7. PRINT the response            → print(response["messages"][-1].text)
+```
+
+> ⚠️ `create_agent` is the **assembly** step — it must come AFTER 1–3 (you can't build the agent before its materials exist). `model_provider`/`api_key` only ever live in `init_chat_model` (step 1).
+
+**Maps onto the 4 moves:** Worker = steps 1–4 (build the tooled-up model) · Post-it = step 5 (HumanMessage) · Box = step 6 (invoke) · Read = step 7 (print).
+
+**What can be omitted:** [2] if no tools needed, [3] if no persona needed — the skeleton still holds.
