@@ -25,10 +25,19 @@ Return recipe suggestions and eventually the recipe instructions to the user, if
 
 """
 
+import os
+
+from langchain.chat_models import init_chat_model
 from langchain.agents import create_agent
 
+model = init_chat_model(
+    model="gemini-3.1-flash-lite",
+    model_provider="google-genai",
+    api_key=os.getenv("GOOGLE_API_KEY"),
+)
+
 agent = create_agent(
-    model="gpt-5-nano",
+    model=model,
     tools=[web_search],
     system_prompt=system_prompt
 )

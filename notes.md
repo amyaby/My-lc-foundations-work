@@ -17,6 +17,7 @@
 10. Mental model: `invoke` is a waiter (the tape & hidden loop)
 11. LangChain × providers: string guessing vs. explicit pinning (AI Studio fix)
 12. Tavily: ready-made tool vs. build your own
+13. Multimodal: how images & audio become tokens
 
 ## Chatbot vs RAG vs Agentic vs Corrective RAG
 
@@ -504,3 +505,61 @@ run 2: LOAD "1" → [Human, AI] → append new msg → model sees FULL transcrip
 4. **Compression:** summarize/trim old messages when the thread grows — trade fidelity for context space.
 
 > One-liner: *the notebook's chat list, the agent's checkpointer, and a vector memory store are all the same trick — get the relevant history back IN FRONT of the model before it answers.*
+
+## Multimodal: how images & audio become tokens
+
+> One-liner: *base64 is the TAXI that carries the bytes inside JSON — the encoders are the METAMORPHOSIS that turns pixels/sound waves into the LLM's own language: **tokens**.*
+
+### Two separate problems
+1. **Transport** — you must GET the bytes to the model's server. JSON is text-only, so binary gets re-encoded as text: **base64** (6 bits → 1 ASCII char, file ~+33% bigger). The client sends `{"type": "image", "base64": "...", "mime_type": "image/png"}`; the server decodes it back to bytes.
+2. **Understanding** — the transformer only reads **token embeddings** (built from text). Raw pixels / raw audio samples mean nothing to it. Something must *convert* them.
+
+### The pipeline (image)
+```
+PNG bytes
+   │  server decodes base64 → pixel matrix (H×W×3)
+   ▼
+VISION ENCODER  (CLIP/ViT — slices the image into 16×16 patches)
+   │  each patch → a vector capturing edges, shapes, textures
+   ▼  (hundreds of vectors: too many, too much pixel-level detail)
+PROJECTOR  (a couple of neural-net layers)
+   │  maps those vectors → IMAGE TOKENS
+   ▼  (same shape as word-token embeddings → SAME latent space)
+TRANSFORMER
+   │  attention mixes image tokens with text tokens
+   ▼
+answer tokens → your `response['messages'][-1].content`
+```
+
+### The pipeline (audio)
+```
+WAV bytes
+   │  server decodes base64 → samples
+   ▼
+AUDIO SEGMENTER  (chunks, ~10–30 s)
+   │
+   ▼
+AUDIO EMBEDDER  (waveform → spectral features → vectors)
+   ▼
+audio embeddings → AUDIO TOKENS  (same token space as text)
+   ▼
+TRANSFORMER attention  (fuses text + audio)
+   ▼
+answer tokens
+```
+
+### Key facts
+- **"To the LLM, vision/audio is just more tokens in the prompt."** Same attention, same next-token prediction — it never "sees" or "hears".
+- **Why base64 at all?** Because the API contract is JSON, and JSON has no binary type (same reason email uses MIME/base64 attachments). The taxi, not the brain.
+- **Content blocks = a tagged union:** `{type: text|image|audio, ...payload}` — the `type` tells the parser which encoder to route the payload through. Answers come back in the *same* block shape (full symmetry: you send blocks, it answers with blocks).
+- **Context cost:** one small image ≈ hundreds/thousands of tokens (vs ~4 chars/token for text). Multimodal eats context.
+- **High-res:** modern VLMs *tile* large images (anyres) so small text isn't smeared — but tokens multiply again.
+
+### Verified on Gemini (module 1.4, free `gemini-3.1-flash-lite`)
+- 64×64 red PNG → "crimson/deep red" ✅
+- user's real `vangogh.png` (1.5 MB) → described an invented capital city ✅
+- 440 Hz sine WAV → "the sound of a beep" ✅
+
+### Why the RECORDING cell in 1.4 fails (`PortAudioError: Error querying device -1`)
+- `sounddevice` records on the machine running the Python **kernel**. The kernel runs in **WSL-Linux**, and WSL exposes **no mic input by default** (WSLg outputs speakers, not mic-in) → OS reports "no default input device" → PortAudio's `-1` = "default" doesn't exist.
+- **Not** a code/model problem. Fix: record on Windows (Voice Recorder / Win+Shift+S → `.wav`), then **browser-upload** it via a `FileUpload` widget — exactly like the image cell.
