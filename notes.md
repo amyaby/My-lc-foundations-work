@@ -18,6 +18,7 @@
 11. LangChain × providers: string guessing vs. explicit pinning (AI Studio fix)
 12. Tavily: ready-made tool vs. build your own
 13. Multimodal: how images & audio become tokens
+14. MCP: the USB-C of AI integrations
 
 ## Chatbot vs RAG vs Agentic vs Corrective RAG
 
@@ -563,3 +564,202 @@ answer tokens
 ### Why the RECORDING cell in 1.4 fails (`PortAudioError: Error querying device -1`)
 - `sounddevice` records on the machine running the Python **kernel**. The kernel runs in **WSL-Linux**, and WSL exposes **no mic input by default** (WSLg outputs speakers, not mic-in) → OS reports "no default input device" → PortAudio's `-1` = "default" doesn't exist.
 - **Not** a code/model problem. Fix: record on Windows (Voice Recorder / Win+Shift+S → `.wav`), then **browser-upload** it via a `FileUpload` widget — exactly like the image cell.
+
+## MCP: the USB-C of AI integrations
+
+> One-liner: *MCP solves the **integration jungle** — one wire for every AI app ↔ every tool.*
+
+### Before MCP
+Every app-model pair needed **custom glue** (SDK setup, auth, call formatting, error handling):
+
+```
+app A (Gemini) ──custom code── Slack
+app A (Gemini) ──custom code── GitHub
+app B (Claude) ──custom code── Slack   ← same Slack, rewritten again
+```
+
+**N apps × M tools = N×M hand-written connectors** — duplicated plumbing, nothing portable.
+
+### After MCP
+One open standard (JSON-RPC 2.0, Anthropic Nov 2024) for apps ↔ data/tools:
+
+```
+app A ─┐
+app B ─┼─ MCP client ── MCP server ── Slack / GitHub / DB / Drive / anything
+app C ─┘               (one implementation serves every app)
+```
+
+### The 3 hats it standardizes
+| Hat | Role (chef version) | Server decorator |
+|---|---|---|
+| **Tools** | hands — functions the model can *call* (`web_search`) | `@mcp.tool()` |
+| **Resources** | files — data the app can *pull* by URI (recipe index) | `@mcp.resource("uri://...")` |
+| **Prompts** | script — reusable system-prompt templates (chef persona) | `@mcp.prompt()` |
+
+**Analogy:** before MCP every device had its own custom port; MCP is **USB-C** — a tool maker builds *one* server, every MCP app uses it; an app ships *one* client, every MCP server plugs in. (Module 2: server file `resources/2.1_mcp_server.py` + client `MultiServerMCPClient`, async `await client.get_tools()`, `model="gpt-5-nano"` → swap to Gemini.)
+
+### Mental-model flow (in order)
+> **Build → Decorate → Serve → Connect → Collect → Assemble → Ask** *(server first, then client)*
+
+1. **Build** — `mcp = FastMCP("name")` (kitchen opens)
+2. **Decorate** — hang the 3 hats: `@mcp.tool()` / `@mcp.resource("uri")` / `@mcp.prompt()`
+3. **Serve** — `mcp.run(transport="stdio")` under `__main__`
+4. **Connect** — `MultiServerMCPClient({"name": {transport, command, args}})`
+5. **Collect** — `await get_tools()` + `get_resources(name)` + `get_prompt(name, "prompt")` → unwrap `[0].content`
+6. **Assemble** — `create_agent(model, tools, system_prompt)`
+7. **Ask** — `await agent.ainvoke({"messages": [...]})`
+
+**Traps:** client is async (`await` everywhere); server secrets never leave the server; `model="gpt-5-nano"` → Gemini swap at step 6.
+
+### MCP client ↔ server ↔ tool (mermaid)
+```mermaid
+sequenceDiagram
+    autonumber
+    participant AG as Agent (llm + create_agent)
+    participant MC as MCP Client (MultiServerMCPClient)
+    participant TP as Transport (stdio pipe or HTTP)
+    participant SE as MCP Server (FastMCP "local_server")
+    participant TO as Tool (search_web → Tavily)
+
+    AG->>MC: get_tools()
+    MC->>TP: JSON-RPC "tools/list"
+    TP->>SE: tools/list
+    SE-->>TP: registered @mcp.tool()s
+    TP-->>MC: JSON: tool schemas
+    MC-->>AG: LangChain tools
+
+    AG->>AG: create_agent(model, tools, system_prompt)
+
+    AG->>MC: tool call search_web("chicken rice")
+    MC->>TP: JSON-RPC "tools/call" {name, arguments}
+    TP->>SE: tools/call
+    SE->>TO: query
+    TO-->>SE: results (Tavily)
+    SE-->>TP: JSON result
+    TP-->>MC: result
+    MC-->>AG: ToolMessage
+    AG->>AG: llm reads results → final answer
+```
+
+### The build pipeline (server → client → agent)
+```mermaid
+flowchart LR
+    S["mcp = FastMCP('mcp_server')"]
+    T["@mcp.tool() search_web"]
+    R["@mcp.resource('uri://...')"]
+    P["@mcp.prompt() prompt"]
+    RUN["mcp.run transport='stdio'"]
+    C["MultiServerMCPClient({ ... spawn ... })"]
+    GT["await get_tools()"]
+    GR["await get_resources(name)"]
+    GP["await get_prompt(name,'prompt')"]
+    SP["system_prompt = prompt[0].content"]
+    CA["create_agent(model, tools, system_prompt)"]
+    AI["await agent.ainvoke({...})"]
+
+    S --> T
+    S --> R
+    S --> P
+    T --> RUN
+    R --> RUN
+    P --> RUN
+    RUN -- "stdio pipe (JSON-RPC)" --> C
+    C --> GT
+    C --> GR
+    C --> GP
+    GP --> SP
+    GT --> CA
+    SP --> CA
+    CA --> AI
+
+    classDef s fill:#16324f,stroke:#4c8bf5,color:#e8f1ff;
+    class S,T,R,P,RUN s
+    classDef c fill:#123c33,stroke:#2ecc9b,color:#e6fff7;
+    class C,GT,GR,GP,SP c
+    classDef a fill:#4a1630,stroke:#f56c9b,color:#ffe3ef;
+    class CA,AI a
+```
+
+### Where the tools go (server → client → agent)
+> Tools flow **one way**: the server publishes them, the client fetches & converts them, the agent holds and uses them.
+
+```
+MCP SERVER                       CLIENT                          AGENT
+(publishes tools)              (fetches & converts)          (holds the tools)
+─────────────────              ───────────────────             ──────────────
+@mcp.tool() search_web   ──►   await client.get_tools()  ──►   tools = [search_web, ...]
+@mcp.tool() get_stocks   ──►        "hand me your hats"  ──►   create_agent(model, tools=tools)
+
+         tools flow ONE WAY:  server ──► client ──► agent
+```
+
+- The **server owns** the tools; the **agent borrows** them (via the client + stdio pipe).
+- When the model calls `search_web`, the client relays it over the pipe and the **server executes** it (with its own secrets) before returning the result.
+- And it's a **choice**: the model calls a tool only when it needs info it doesn't have AND the tool's description matches (e.g. "2+2" → no call; "tell me about langchain-mcp-adapters" → calls `search_web`).
+
+## Multi-agent architecture (tiered) — 2.3 pattern
+
+### Schema (mermaid)
+
+```mermaid
+flowchart TD
+    subgraph T3["Tier 3 · MAIN / ORCHESTRATOR (router)"]
+        MAIN["main_agent = create_agent(model, tools=[call_subagent_1, call_subagent_2], system_prompt=...)"]
+        ROUTER{{"routes by NAME + DESCRIPTION<br/>(never sees leaf tools)"}}
+        MAIN --- ROUTER
+    end
+
+    subgraph T2["Tier 2 · SUBAGENT AS TOOL (bridge)"]
+        W1["@tool call_subagent_1(x)<br/>→ subagent_1.invoke(messages)<br/>→ returns response.messages[-1].content"]
+        W2["@tool call_subagent_2(x)<br/>→ subagent_2.invoke(messages)<br/>→ returns response.messages[-1].content"]
+    end
+
+    subgraph T1["Tier 1 · SUBAGENTS (workers, one specialty each)"]
+        S1["subagent_1 = create_agent(model, tools=[square_root])"]
+        S2["subagent_2 = create_agent(model, tools=[square])"]
+    end
+
+    subgraph T0["Tier 0 · LEAF TOOLS (real abilities)"]
+        L1["@tool square_root(x)<br/>return x ** 0.5"]
+        L2["@tool square(x)<br/>return x ** 2"]
+    end
+
+    Q(["Question:<br/>'sqrt of 456?'"]) --> MAIN
+    ROUTER -->|"matches desc 'square root'"| W1
+    ROUTER -->|"matches desc 'square'"| W2
+    W1 --> S1
+    W2 --> S2
+    S1 --> L1
+    S2 --> L2
+    L1 -.->|"number comes<br/>BACK UP the tiers"| W1
+    W1 -.-> MAIN
+    MAIN -.->|"final answer"| A(["Answer to user"])
+
+    classDef t3 fill:#4a1630,stroke:#f56c9b,color:#ffe3ef;
+    classDef t2 fill:#5c3a00,stroke:#f0a92b,color:#fff3d9;
+    classDef t1 fill:#123c33,stroke:#2ecc9b,color:#e6fff7;
+    classDef t0 fill:#16324f,stroke:#4c8bf5,color:#e8f1ff;
+    class MAIN,ROUTER,MAIN t3;
+    class W1,W2 t2;
+    class S1,S2 t1;
+    class L1,L2 t0;
+```
+
+### Rules of the stack
+
+1. **An agent is NOT a tool** — wrap each subagent in a `@tool` that does `subagent_N.invoke({...})` and returns `response["messages"][-1].content` (Tier 2 is the bridge).
+2. **Routing by description** — Tier 3 only sees `call_subagent_1` ("…square root…") / `call_subagent_2` ("…square…"); the **docstrings are the menu**.
+3. **Each tier owns its loop** — Tier 1 runs its own `model → leaf tool → model` cycle internally.
+4. **One leaf-tool = one subagent** — separation of concern: main gets *capability*, leaf gets *implementation*.
+
+### Data flow
+
+```
+Question: "What is the square root of 456?"
+  1. TIER 3  main reads catalogue → desc matches "square root"
+  2.        → calls call_subagent_1(456)          (main does NOT do math)
+  3. TIER 1  subagent_1 runs its loop → square_root(456)         ← TIER 0
+  4.        → returns result up to the wrapper
+  5. TIER 2  wrapper returns response["messages"][-1].content → main
+  6. TIER 3  main formats the final answer for the user
+```
