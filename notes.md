@@ -19,6 +19,13 @@
 12. Tavily: ready-made tool vs. build your own
 13. Multimodal: how images & audio become tokens
 14. MCP: the USB-C of AI integrations
+15. Managing long conversations (Middleware · Agent · Checkpointer · Store)
+16. The wedding agent walkthrough + the SQL path fix
+17. Python return types for chatbots (dict vs list)
+18. Python's useful built-in errors (the common families)
+19. The full request flow (client → API → logic → DB/LLM/API) + where errors appear
+20. Agent memory: checkpointer + thread_id (remembering conversations)
+21. The 4 token-saving families (+ Trim explained)
 
 ## Chatbot vs RAG vs Agentic vs Corrective RAG
 
@@ -763,3 +770,638 @@ Question: "What is the square root of 456?"
   5. TIER 2  wrapper returns response["messages"][-1].content → main
   6. TIER 3  main formats the final answer for the user
 ```
+
+## The Ultimate LangChain Canvas (reuse for ANY agent you build)
+
+### Why LangChain (vs raw API calls)
+- **One uniform API** over every provider — swap OpenAI ⇄ Gemini in one line (`init_chat_model`).
+- **One normalizer for everything external** — `@tool`, MCP `get_tools()`, retrievers, DBs all become the same shape: `name + description + JSON schema`.
+- **The loop is handled** for you: decide-to-call → execute → feed ToolMessage back → repeat, until final answer.
+- **Memory, state, context, streaming, tracing (LangSmith)** all plug into the same objects.
+- **It sits on LangGraph** — start simple (`create_agent`), drop to graph-level control when needed.
+
+### LangChain vs LangGraph
+| | **LangChain** (`create_agent`) | **LangGraph** (raw graphs) |
+|---|---|---|
+| abstraction | high-level: **blocks** | low-level: **nodes + edges** |
+| control flow | the loop is prebuilt & opinionated | YOU design the flow (branch, cycle, checkpoint mid-run) |
+| good for | 80% of agents: tools + loop + memory | custom flows: HITL approval, cycles, parallel branches, state machines |
+| mental model | "give it a brain, hands, prompt" | "draw a program as a state machine, then run it" |
+| relationship | **`create_agent` is a LangGraph graph under the hood** | the engine LangChain's agents are built on |
+
+Rule of thumb: **build with LangChain first; drop to LangGraph only when you need to draw your own arrows.**
+
+### The 6 LAYERS (the canvas)
+
+```
+LAYER 4 · THE LOOP (who talks, in what order)      ← LangGraph drives it
+         model node ⇄ tool node  (repeat until no tool_calls)
+───────────────────────────────────────────────────────────────
+LAYER 3 · THE AGENT (how it's combined)
+         create_agent(model, tools, system_prompt, state_schema, checkpointer, middleware)
+───────────────────────────────────────────────────────────────
+LAYER 2 · THE BRAIN (any provider)
+         model = init_chat_model(...) → model.invoke / ainvoke
+───────────────────────────────────────────────────────────────
+LAYER 1 · THE HANDS (what you expose)
+         @tool fns · MCP get_tools() · retriever · SQL/web
+───────────────────────────────────────────────────────────────
+LAYER 0 · THE FUEL (inputs + memory)
+         messages list · State (suitcase) · Context (briefing) · checkpointer(thread_id)
+```
+
+### The universal 5-step build (EVERY LangChain agent)
+1. **Hands** — `@tool` / `client.get_tools()` / retriever → the catalog.
+2. **Memory shape** — `state_schema=` and/or `context_schema=` + `checkpointer=` (optional).
+3. **Brain** — `model = init_chat_model("gemini-3.1-flash-lite", ...)` once.
+4. **Agent** — `create_agent(model=model, tools=..., system_prompt=..., state_schema=..., checkpointer=...)`.
+5. **Run** — `resp = agent.invoke({"messages":[HumanMessage(...)]}, config)` → read `resp["messages"][-1].content`.
+
+### The universal FLOW (mental flux of every run)
+```
+user text → {"messages":[HumanMessage]} → create_agent's LOOP:
+  model sees messages + tool catalog
+      → no tool needed?      answer → DONE  (read response["messages"][-1].content)
+      → tool needed?         CALL tool (local fn / MCP / DB / web)
+                             ToolMessage back into messages
+                             loop again with tool result … repeat
+  checkpointer snapshots state after each step under thread_id
+  state/context feed the loop extra data (mutable vs read-only)
+```
+
+### Mermaid — the flow
+
+```mermaid
+flowchart TD
+    U["User text"] --> M0["INPUT<br/>{messages:[HumanMessage]}<br/>+ state/context"]
+    M0 --> CA
+
+    subgraph AGENT["LangChain create_agent  (builds a LangGraph graph)"]
+        CA["create_agent(model, tools, system_prompt,<br/>state_schema, checkpointer)"]
+        CA --> LOOP{"MODEL NODE<br/>reads messages + tool catalog"}
+        LOOP -- "emits tool_calls" --> TOOLS["TOOL NODE<br/>executes catalog"]
+        LOOP -- "no tool_calls" --> FIN["final answer"]
+        TOOLS -- "ToolMessage → messages" --> LOOP
+    end
+
+    subgraph HANDS["LAYER 1 · HANDS"]
+        T1["@tool fns"]
+        T2["MCP server<br/>(get_tools)"]
+        T3["retriever / DB / web"]
+    end
+
+    subgraph FUEL["LAYER 0 · FUEL"]
+        ST["State (mutable, persisted)"]
+        CT["Context (read-only, per-call)"]
+        CP["checkpointer + thread_id"]
+    end
+
+    subgraph BRAIN["LAYER 2 · BRAIN"]
+        B["init_chat_model<br/>Gemini / OpenAI / ..."]
+    end
+
+    TOOLS --> HANDS
+    HANDS --> TOOLS
+    CA -.reads.-> BRAIN
+    FUEL -.reads/writes.-> CA
+    FIN --> OUT["resp['messages'][-1].content"]
+
+    classDef lc fill:#16324f,stroke:#4c8bf5,color:#e8f1ff;
+    classDef lg fill:#4a1630,stroke:#f56c9b,color:#ffe3ef;
+    classDef h fill:#123c33,stroke:#2ecc9b,color:#e6fff7;
+    class CA,LOOP,TOOLS,FIN,OUT lc;
+    class ST,CT,CP h;
+    class B h;
+```
+
+### The UNIVERSAL AGENT SKELETON (apply to ANY agent)
+
+| # | Step (generic) | Wedding example |
+|---|---|---|
+| **0** | **Setup** — load `.env`, imports | `load_dotenv()` |
+| **1** | **Create the model** (one brain, reuse everywhere) | `model = init_chat_model("gemini-3.1-flash-lite", ...)` |
+| **2** | **Shape State** *(skip if single-agent / no cross-turn data)* | `class WeddingState(AgentState): origin, destination, guest_count, genre` |
+| **3** | **Create the tools (Tier 0)** — local `@tool` fns + **MCP only if data belongs to someone else** | `@tool web_search` (Tavily) · `@tool query_playlist_db` (SQLite) · `tools = await client.get_tools()` (Kiwi MCP) |
+| **4** | **Create subagents (Tier 1)** — ONE per specialty, own tools + own rules | `travel_agent` · `venue_agent` · `playlist_agent` |
+| **5** | **Wrap subagents as tools (Tier 2)** — `@tool def call_X(runtime): subagent_X.invoke(...) → return response["messages"][-1].content` | `search_flights`, `search_venues`, `suggest_playlist` (+ `update_state` = `Command(update)`) |
+| **6** | **Create the main agent (Tier 3)** — `create_agent(model, tools=[wrappers], state_schema=..., system_prompt=workflow)` | `coordinator = create_agent(model, tools=[...], state_schema=WeddingState, system_prompt=...)` |
+| **7** | **Run it** — `invoke` (sync) or `await ainvoke` (async/MCP) | `await coordinator.ainvoke({"messages":[HumanMessage(...)]}, config={"recursion_limit":40})` |
+| **8** | **Read the answer** — `response["messages"][-1].content` | `print(response["messages"][-1].content)` |
+| **9** | **Verify** — check flow, prompts, edge cases | state collected first? specialists answered? |
+
+### Decision key (when to CUT steps)
+- **Single agent, no memory across calls** → skip 2, 4, 5, 6 ⇒ just **1 → 3 → create_agent → 7**.
+- **No third-party live service** → skip the MCP part of step 3.
+- **Read-only inputs, no persistence** → use `context_schema=` instead of `state_schema=`.
+- **Parallel flow / human-in-the-loop / custom branching** → at step 6 drop into **raw LangGraph** (draw your own nodes/edges).
+
+### The one-liner that explains every agent
+**"A brain (model) with hands (tools) following rules (system_prompt), carrying a suitcase (state/context), looping model⇄tool until it has your answer."**
+
+### The AI Agent at a glance (what the 4 pillars do)
+
+```
+                    AI AGENT
+                       │
+        ┌──────────────┼───────────────┐
+        │              │               │
+      STATE          CONTEXT       MIDDLEWARE
+        │              │               │
+   remembers       gives useful    controls/
+   workflow        information     modifies flow
+                                        │
+                                        │
+                                       MCP
+                                        │
+                              connects external
+                                  capabilities
+```
+
+- **State** → remembers workflow (mutable, persisted, `Command(update)`, checkpointer).
+- **Context** → gives useful info (read-only, per-call, `runtime.context`).
+- **Middleware** → controls/modifies flow (wrap model & tool calls, guards, dynamic prompts).
+- **MCP** → connects external capabilities (tools/resources/prompts from remote or local servers).
+
+### The LangChain stack (what's inside, top → bottom)
+
+```
+                    LangChain
+                       │
+        ┌──────────────┼─────────────┐
+        ↓              ↓             ↓
+      Agents         Tools         Middleware
+        │
+        ↓
+      State
+        │
+        ↓
+      Context
+        │
+        ↓
+    external systems
+        │
+        ↓
+       MCP
+```
+
+Reading it as layers: **Agents** (driven by **Tools** + **Middleware**) sit on **State** (workflow memory) → **Context** (per-call info) → reach **external systems** through **MCP**.
+
+### FastMCP vs MultiServerMCPClient
+
+| | **FastMCP** | **MultiServerMCPClient** |
+|---|---|---|
+| role | build a server (expose your tools) | connect to servers (fetch tools) |
+| side | the **chef/kitchen** | the **waiter** |
+| who uses it | Kiwi (their side) & you in 2.1 server file | you (your notebook/agent) |
+
+Same MCP protocol, opposite sides: FastMCP **serves** tools (`@mcp.tool()`), MultiServerMCPClient **consumes** them (`get_tools()` → normal LangChain tools).
+
+### SQL connection URIs (cheat-sheet)
+
+Put these in `SQLDatabase.from_uri(...)`:
+
+| Target | URI |
+|---|---|
+| SQLite file | `sqlite:///path/to/file.db` |
+| Postgres | `postgresql://user:password@host:5432/dbname` |
+| MySQL | `mysql+pymysql://user:password@host/dbname` |
+| SQLite in memory (test) | `sqlite:///:memory:` |
+
+Recipe to create your own SQLite from a CSV:
+
+```python
+import sqlite3, pandas as pd
+df = pd.read_csv("mes_donnees.csv")
+con = sqlite3.connect("resources/MonDB.db")      # creates the file
+df.to_sql("ma_table", con, if_exists="replace", index=False)
+con.close()
+```
+
+## Managing long conversations (Middleware · Agent · Checkpointer · Store)
+
+> *The full home of an agent request — out in front: **middleware** checks the message; the **agent** runs the loop; the **checkpointer** snapshots the thread; the **store** remembers across threads.*
+
+```
+                    USER
+                     │
+                     ▼
+              ┌─────────────┐
+              │ Middleware  │
+              │             │
+              │ Trim?       │
+              │ Summarize?  │
+              │ Other logic?│
+              └──────┬──────┘
+                     │
+                     ▼
+                  AGENT
+                     │
+             ┌───────┴───────┐
+             ▼               ▼
+            LLM             TOOLS
+             │
+             ▼
+          RESPONSE
+
+
+CHECKPOINTER
+     │
+     └── saves conversation state
+          by thread_id
+
+
+STORE
+     │
+     └── saves long-term user information
+          across threads
+```
+
+### Middleware — the guard corridor (before the agent, and around each call)
+
+- The **first thing** a user message hits. Cross-cutting logic that applies to *every* request, without touching the agent itself.
+- Hooks: `before_agent` / `after_agent`, `before_model` / `after_model`, `wrap_model_call`, `wrap_tool_call`, `transformers` (`AgentMiddleware(transformers=[change_state])`).
+- **Trim? Summarize? Other logic?** all live here.
+
+| Decision | Why | API in this venv |
+|---|---|---|
+| **Trim** (delete old) | free up tokens cheaply, lossy | `AgentMiddleware(transformers=[def trim(state, runtime): ...])` or `trim_messages(..., max_tokens=...)` |
+| **Summarize** (compress old) | keep meaning, lose detail | `SummarizationMiddleware(model=model, trigger=("tokens", 40000), keep=("messages", 20))` |
+| Other | logging, guards, dynamic prompts | `AgentMiddleware(awrap_tool_call=..., dynamic_prompt=...)` |
+
+### Agent — the loop (brain + hands)
+
+- Receives the (possibly trimmed/summarized) message; **loops LLM ⇄ TOOLS** until it has a final answer.
+- The whole conversation lives in `state["messages"]` → that list is what middleware trims/summarizes.
+- `create_agent(model=..., tools=..., middleware=[...], checkpointer=..., store=...)`.
+
+### LLM + TOOLS — the two hands of the loop
+
+- **LLM** = the brain, reads the message history (the walking tape). **TOOLS** = the abilities the model can call in a loop (MCP, Tavily, SQL, sub-agents…).
+- The model decides *when* to call a tool; the tool output comes back as a message into the same history.
+
+### Checkpointer — memory WITHIN a conversation
+
+- Saves a **snapshot of the whole state** (messages + custom fields) **by `thread_id`** after every step.
+- Same `thread_id` = the conversation **resumes** (any number of turns, across calls/restarts). Different id = separate conversation.
+- `create_agent(..., checkpointer=InMemorySaver())` → `config={"configurable": {"thread_id": "1"}}`.
+- `InMemorySaver` = RAM only (learning). `SqliteSaver` / Postgres = survives restarts (not installed here).
+
+### Store — memory ACROSS conversations
+
+- Long-term user facts that outlive any single thread (e.g., "the wedding is in Paris, 100 guests, jazz").
+- The agent **saves** via a tool during a conversation, **retrieves** in a later one ("semantic memory").
+- `create_agent(..., store=InMemoryStore())`; write/query with namespaces `(namespace, key)`.
+
+### How it all combines (module 3 pattern)
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import SummarizationMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
+
+agent = create_agent(
+    model=model, tools=tools,
+    middleware=[SummarizationMiddleware(model=model, trigger=("tokens", 40000))],
+    checkpointer=InMemorySaver(),          # within-thread memory
+    store=InMemoryStore(),                 # across-thread memory
+)
+agent.invoke({"messages": [("user", "hi")]},
+             config={"configurable": {"thread_id": "1"}})
+```
+
+**One-liner:** *Trim deletes, Summarize compresses, Checkpointer resumes the same thread, Store remembers across threads.*
+
+Then: `db = SQLDatabase.from_uri("sqlite:///resources/MonDB.db")` → test with `db.run(...)` → wrap in a `@tool` with `try/except` → in the system prompt: *"Discover the schema first, then query."*
+
+## The wedding agent walkthrough (a real question, step by step)
+
+> *One sentence in → **state first**, then **3 parallel experts**, then **one coordinated answer**. Every tool result is just another message on the same tape.*
+
+**Question:** *"I'm from London and I'd like a wedding in Paris for 100 guests, jazz-genre"*
+
+### TURN 1 — the state gate (1 tool call)
+
+The model reads the sentence, sees all 4 facts are present, so it calls:
+
+```
+update_state(origin="London", destination="Paris", guest_count="100", genre="jazz")
+```
+
+- A **wrapper tool** — no sub-agent, no leaf tool.
+- Writes into state via `Command(update=...)` + returns `ToolMessage("Successfully updated state")`.
+- **Must run first** so the other 3 tools can read `runtime.state` when they fire.
+- It only reads the model's hidden state — nothing comes from the outside yet.
+
+### TURN 2 — the delegation (3 tool calls **in parallel**)
+
+State is filled → the model fires 3 `tool_calls` in **one** message:
+
+| Wrapper tool | Delegates to | Leaf tools (real abilities) |
+|---|---|---|
+| `search_flights` (async) | `travel_agent.ainvoke(...)` | Kiwi **MCP** tools: `search-flight` (`https://mcp.kiwi.com`) → real flights LGW→CDG €58 |
+| `search_venues` | `venue_agent.invoke(...)` | **Tavily** `web_search` (max 12 searches) → venues (€5,800 barn, château, Shangri-La) |
+| `suggest_playlist` | `playlist_agent.invoke(...)` | `query_playlist_db` → `db.run("SELECT ... FROM Track ...")` on Chinook → 130 jazz tracks |
+
+- Each sub-agent is **its own `create_agent` loop**: model ⇄ its own tools until it answers.
+- The wrapper returns `response["messages"][-1].content` — a **str** that becomes a `ToolMessage` in the coordinator's state.
+
+### TURN 3 — the coordination
+
+All 3 results are now messages. The coordinator calls **no more tools** (`finish_reason: STOP`) and writes the final plan: flights + venues + playlist, one polished answer.
+
+### Where tools "intervene" (layer 0 → 3 — isolation is the point)
+
+```
+0  coordinator sees ONLY: update_state · search_flights · search_venues · suggest_playlist
+   ├─ 1  travel_agent   sees ONLY Kiwi tools
+   ├─ 1  venue_agent    sees ONLY the web_search tool
+   └─ 1  playlist_agent sees ONLY query_playlist_db
+```
+
+- The coordinator never touches leaf tools; sub-agents never touch each other's.
+- `recursion_limit=40` exists so the nesting (coordinator → sub-agent → leaf) doesn't hit the step ceiling.
+
+### Why the SQL path broke (and the fix)
+
+```python
+SQLDatabase.from_uri("sqlite:///resources/Chinook.db")   # RELATIVE to kernel cwd
+```
+
+- SQLite resolves a relative path from the **kernel's working directory** — not the notebook's folder.
+- JupyterLab: cwd = notebook folder → works. **VS Code: cwd = workspace root** → `resources/` missing → `OperationalError: unable to open database file`.
+- **Rule:** *relative paths in a notebook resolve against the kernel's cwd* — when a path bugs you, print `os.getcwd()`.
+
+Fix (path-anchored, works from any cwd):
+
+```python
+from pathlib import Path
+from langchain_community.utilities import SQLDatabase
+
+_db = next((p for p in [
+    Path("/absolute/path/resources/Chinook.db"),
+    Path.cwd() / "notebooks" / "module-2" / "resources" / "Chinook.db",
+    Path.cwd() / "resources" / "Chinook.db",
+] if p.exists()), None)
+db = SQLDatabase.from_uri(f"sqlite:///{_db}")
+```
+
+## Python return types for chatbots (dict vs list reference)
+
+> *A `dict` stores **one** object with named fields (keys); a `list` stores **many** values in order — often a `list` of `dict`s.*
+
+| Case | Usually returns | Example output | How to access it |
+|---|---|---|---|
+| One object/result | `dict` | `{"article": "505", "similarity": 0.91, "source": "code-penal.pdf"}` | `result["article"]` |
+| Multiple objects/results | `list[dict]` | `[{"article": "505", "score": 0.91}, {"article": "506", "score": 0.85}]` | `results[0]["article"]` |
+| Multiple messages | `list[dict]` | `[{"role": "user", "content": "ما عقوبة السرقة؟"}, {"role": "assistant", "content": "يعاقب القانون..."}]` | `messages[0]["content"]` |
+| One user's information | `dict` | `{"id": 1, "name": "Imane", "role": "student", "city": "Casablanca"}` | `user["name"]` |
+| Search results | `list[dict]` | `[{"title": "مدونة الأسرة", "url": "https://example.com", "snippet": "الفصل 171..."}]` | `results[0]["url"]` |
+| One document | `dict` or object | `{"id": 12, "filename": "code-famille.pdf", "page": 17, "text": "مادة 171..."}` | `document["filename"]` |
+| Multiple documents | `list[dict]` | `[{"id": 1, "title": "القانون الجنائي"}, {"id": 2, "title": "مدونة الأسرة"}]` | `documents[1]["title"]` |
+| One tool result with fields | `dict` | `{"city": "Casablanca", "temperature": 27, "weather": "sunny"}` | `tool_result["temperature"]` |
+| Multiple tool results | `list` | `[{"tool": "weather", "result": {"temperature": 27}}, {"tool": "time", "result": {"time": "14:30"}}]` | `results[0]["result"]` |
+| Agent state | `dict` | `{"task": "حضانة الأطفال", "status": "completed", "answer": "..."}` | `state["status"]` |
+| Messages inside LangGraph state | `list[dict]` | `{"messages": [{"role": "user", "content": "ما هي الحضانة؟"}, {"role": "assistant", "content": "..."}]}` | `state["messages"][-1]` |
+| Complete LangGraph state | `dict` | `{"messages": [...], "sources": [...], "answer": "...", "retry_count": 0}` | `state["answer"]` |
+| No result found | `None` | `search("unknown topic") → None` | `if result is None:` |
+| One selected option | `str` | `"model": "gemini-3.1-flash-lite"` | `result["model"]` |
+| Multiple selected options | `list[str]` | `["القانون الجنائي", "مدونة الأسرة", "مدونة الشغل"]` | `options[0]` |
+| Number of results | `int` | `len(results) → 5` | `print(count)` |
+| Yes/no result | `bool` | `document_exists → True` | `if document_exists:` |
+| One database row | `dict` | `{"id": 1, "law": "القانون الجنائي", "article": "505"}` | `row["article"]` |
+| Multiple database rows | `list[dict]` | `[{"article": "505"}, {"article": "506"}]` | `rows[0]["article"]` |
+| API response, even with one result | `dict` | `{"answer": "النص...", "sources": [{"article": "505"}]}` | `response["answer"]` |
+| API error response | `dict` | `{"error": "Model unavailable", "status": 503}` | `response["error"]` |
+
+The primary structural difference is the return type: a `dict` stores one object with named fields using keys, while a `list` stores multiple values in order, often containing multiple dictionaries.
+
+## Python's useful built-in errors (the common families)
+
+> *You don't need to memorize every Python exception — learn the common families.*
+
+| Error | Meaning |
+|---|---|
+| `SyntaxError` | Python code syntax is invalid |
+| `NameError` | Variable/name doesn't exist |
+| `TypeError` | Wrong type/operation |
+| `ValueError` | Correct type, inappropriate value |
+| `KeyError` | Dictionary key doesn't exist |
+| `IndexError` | List index doesn't exist |
+| `AttributeError` | Object doesn't have that attribute |
+| `FileNotFoundError` | File doesn't exist |
+| `PermissionError` | You don't have permission |
+| `ZeroDivisionError` | Division by zero |
+| `ImportError` | Import problem |
+| `ModuleNotFoundError` | Module/package can't be found |
+| `JSONDecodeError` | Invalid JSON |
+| `TimeoutError` | Operation timed out |
+| `ConnectionError` | Connection failed |
+| `FileExistsError` | File/directory already exists |
+
+**Families to recognize in your code:** name/attribute/type (`NameError`, `AttributeError`, `TypeError`) → the classic `.xx` or missing-import mistakes; container access (`KeyError`, `IndexError`) → empty/missing results from your tools (`if result is None:` or `if "error" in result`); I/O & network (`FileNotFoundError`, `ConnectionError`, `TimeoutError`) → user files and API calls; parsing (`JSONDecodeError`, `ValueError`) → trusting external input.
+
+## The full request flow (client → API → logic → DB / LLM / API) + where errors appear
+
+> *Your chatbot's life as one round-trip: HTTP in → Python model → business logic → outside worlds (DB / LLM / APIs) → serialize → HTTP out.*
+
+```
+                CLIENT
+                  │
+                  │ HTTP
+                  ▼
+             ┌─────────┐
+             │  API    │
+             │FastAPI  │
+             │ Flask   │
+             └────┬────┘
+                  │
+             parse JSON
+                  │
+                  ▼
+          Python data/model
+                  │
+                  ▼
+             business logic
+                  │
+       ┌──────────┼──────────┐
+       ↓          ↓          ↓
+      DB         LLM        API
+       │          │          │
+       └──────────┼──────────┘
+                  ↓
+              result
+                  │
+                  ▼
+          serialize to JSON
+                  │
+                  ▼
+                CLIENT
+```
+
+| Stage of the flow | What happens there | Typical error there |
+|---|---|---|
+| **HTTP in** | client sends JSON to FastAPI/Flask route | `ConnectionError`, `TimeoutError` (client side) |
+| **parse JSON** | body → Python structures | `JSONDecodeError` (invalid body), `ValueError` |
+| **data/model** | JSON → your own objects/dicts | `KeyError` (missing field), `TypeError` |
+| **business logic** | your rules, validations | `ValueError` (right type, bad value) |
+| **DB** | query/insert | `FileNotFoundError` (SQLite file), `KeyError`/`IndexError` on rows |
+| **LLM** | model call | `TimeoutError`, `ConnectionError`, invalid key → `ValueError` |
+| **API** | external service (Tavily/Gemini/MCP) | `ConnectionError`, `TimeoutError`, `503` |
+| **result → serialize** | Python → JSON back out | `TypeError` (e.g. non-serializable object) |
+
+**Quick error decoder (the 8 you'll really see):**
+
+```
+TypeError         → wrong type
+ValueError        → right type, bad value
+KeyError          → dictionary key missing
+IndexError        → list position missing
+AttributeError    → object doesn't have that attribute
+JSONDecodeError   → invalid JSON
+FileNotFoundError → file missing
+ModuleNotFoundError → Python can't find the module
+```
+
+**Rule of the flow:** every arrow is a place things break — so wrap each outside-world call (`DB`/`LLM`/`API`) in `try/except` and return a `{"error": ...}` dict instead of crashing. That's exactly the `@tool` pattern you already write (`except Exception as e: return f"Error ... {e}"`).
+
+## Agent memory: checkpointer + thread_id (remembering conversations)
+
+> *To make an agent **remember previous messages** you need two things: a **checkpointer** (memory storage) + a **`thread_id`** (the conversation's ID). Without them, every `invoke` starts from zero — stateless.*
+
+```python
+from langchain.agents import create_agent
+from langgraph.checkpoint.memory import InMemorySaver
+
+agent = create_agent(
+    model=model, tools=tools,
+    checkpointer=InMemorySaver(),   # << the memory
+)
+
+# turn 1 — same thread_id = same conversation
+agent.invoke({"messages": [("user", "Hi, I'm Imane")]},
+             config={"configurable": {"thread_id": "pfa-1"}})
+
+# turn 2 — the agent REMEMBERS turn 1
+agent.invoke({"messages": [("user", "What's my name?")]},
+             config={"configurable": {"thread_id": "pfa-1"}})
+# → "Imane"
+```
+
+### The rules
+
+| You do | Result |
+|---|---|
+| `checkpointer` + same `thread_id` | agent **remembers everything** in that thread |
+| new `thread_id` | **fresh conversation** (no memory) |
+| no checkpointer | **forgets** on every call (default) |
+| checkpointer but no `thread_id` → error | you must always pass it |
+
+### 3 things to know
+
+1. **`thread_id` is just a string** — use the user's ID (`"pfa-1"` = user 1's chat), so every user gets their own ongoing conversation. That's the setup for the law chatbot.
+2. **`InMemorySaver` forgets on restart** (RAM only). For production → SQLite/Postgres checkpointer so memory survives restarts.
+3. Once you have a checkpointer, the **middleware** superpowers unlock: `SummarizationMiddleware` to keep tokens flat, time-travel, etc.
+
+### Does it remember only the last message? NO — EVERYTHING
+
+The checkpointer snapshots the **entire state** (all messages + custom fields) at the end of every step, saved under the `thread_id`. Next call with the same id → it restores the whole history, then appends.
+
+**Prove it — read the whole stored thread:**
+
+```python
+state = agent.get_state(config={"configurable": {"thread_id": "pfa-1"}})
+for m in state.values["messages"]:
+    print(m.type, "→", m.content[:40])
+# prints ALL messages from all turns, not just the last one
+```
+
+**The trade-off:** full memory = the model sees all history again each turn → more tokens (cost rises). That's why the economy move is: **checkpointer (remembers everything) + SummarizationMiddleware (compresses the middle)** → remembers everything, but in a short summary instead of a growing transcript.
+
+**One-liner:** *no checkpointer = amnesia; checkpointer + thread_id = memory; same id = same chat — and it remembers EVERY message in that thread, forever.*
+
+## The 4 token-saving families (+ Trim explained)
+
+> *All token-saving moves belong to 4 families. Biggest win = the recurring bill = **tools + system + history × every turn** — so summarize-then-cache beats any one-off trick.*
+
+### 1. Shrink what you SEND (context management)
+
+| Move | Saves tokens by | Your tool |
+|---|---|---|
+| **Trim** | deleting old messages | `trim_messages(..., max_tokens=...)` or transformer middleware |
+| **Summarize/compaction** | replacing a huge transcript with ~300 token summary | `SummarizationMiddleware` / Claude `/compact` |
+| **Tool-result clearing** | dropping bulky re-fetchable outputs, keeping the call record | Claude context-editing; your `@tool` returns stay small |
+| **Tight prompts & tool descriptions** | tool schemas + system prompt are re-sent **every** turn — shorter = constant savings | write mini descriptions, not essays |
+| **Small tool outputs** | tools that return `dict`s / short strings instead of full DB dumps | your `str` returns from the wedding agents |
+
+These attack the **recurring** cost: system + tools + history re-sent on every message.
+
+### 2. Architecture (stop sending what's irrelevant)
+
+- **Sub-agents = context isolation.** Only the *specialist* receives the file/DB/tool it needs; the coordinator keeps a tiny context (the tiered wedding design). A sub-agent scanning big documents doesn't stuff them into the coordinator.
+- **Router first.** A cheap model classifies ("travel? law? venue?") → only the right pipeline runs → the LLM never reads unrelated tools/docs.
+- **RAG instead of stuffing.** Send 3 relevant chunks, not the 400-page code penal.
+
+### 3. Model & caching (pay less per token)
+
+- **Small model for 90% of turns** (`gemini-3.1-flash-lite`), escalate to a big model only for hard steps (a cascade).
+- **Prompt caching.** The FAQ prefix (system + tools + summary) is cached → cached reads billed at a tiny fraction. Claude does this automatically; Gemini needs manual *context caching*; `cache=` if your provider supports it.
+- **Cap `max_tokens`** (answers are part of the window; long reasoning/tool loops cost). Limit thinking budgets if the model exposes them.
+
+### 4. Lifecycle
+
+- **Batch API** for non-urgent work (~2× cheaper).
+- **Stream** doesn't save tokens, but makes latency feel instant (UX, not cost).
+- **Persist outside** (store/DB) so you never re-derive or re-ask what's already known.
+
+### Cheat sheet for your stack
+
+```
+cheapest →  small model throughout
+          + trim/summarize history   (keeps per-turn cost FLAT)
+          + sub-agents for heavy reads
+          + RAG for big legal docs
+          + prompt caching if available
+```
+
+### Zoom: "Trim = delete" — what it actually does
+
+**Trim just cuts old messages out of the list BEFORE it's sent.** That's all. The model never sees them again. The tokens they'd cost every turn: gone.
+
+```
+messages (state)                  →  sent to model this turn
+───────────────────────────────────────────────────────────
+[sys, h1, ai, h2, ai, h3, ai,     →  [sys, h3, ai, h4, ai]   ← old ones DELETED
+ h4, ai, h5, ai]      (10 items)      (5 items, max_tokens budget)
+```
+
+Without trim → 10 items in every call · With trim → 5 items in every call = **half the recurring cost**.
+
+```python
+from langchain_core.messages import trim_messages
+
+trimmed = trim_messages(messages,
+                        token_counter="approximate",
+                        max_tokens=2000,      # budget: keep ~2k tokens
+                        strategy="last",      # keep the newest
+                        include_system=True)  # never delete the system prompt
+```
+
+Or as agent middleware (runs before every model call):
+
+```python
+def trim(state, runtime):
+    if len(state["messages"]) > 15:
+        return {"messages": state["messages"][-15:]}  # keep last 15
+
+agent = create_agent(model=model, tools=tools,
+                     middleware=[AgentMiddleware(transformers=[trim])])
+```
+
+**The cost of trimming = it FORGETS.** The 5 deleted messages' information is gone, permanently (no summary). So the choice is:
+
+| | Keep | Lose | When |
+|---|---|---|---|
+| **Trim** | recent messages | the old ones entirely (**forgets**) | old facts don't matter / want cheapest |
+| **Summarize** | recent messages **+ ~300-token summary** of everything | only the exact wording (**remembers compressed**) | you still need to know WHAT was decided |
+
+**One-liner:** *Trim = delete (cheap, forgets); Summarize = compress (slightly pricier, remembers). Keep the system prompt safe; keep the recent window; budget the middle.*
