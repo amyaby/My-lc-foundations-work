@@ -26,6 +26,7 @@
 19. The full request flow (client → API → logic → DB/LLM/API) + where errors appear
 20. Agent memory: checkpointer + thread_id (remembering conversations)
 21. The 4 token-saving families (+ Trim explained)
+22. Working with JSON in Python, requests & Flask (the full reference)
 
 ## Chatbot vs RAG vs Agentic vs Corrective RAG
 
@@ -1405,3 +1406,73 @@ agent = create_agent(model=model, tools=tools,
 | **Summarize** | recent messages **+ ~300-token summary** of everything | only the exact wording (**remembers compressed**) | you still need to know WHAT was decided |
 
 **One-liner:** *Trim = delete (cheap, forgets); Summarize = compress (slightly pricier, remembers). Keep the system prompt safe; keep the recent window; budget the middle.*
+
+## Working with JSON in Python, `requests` & Flask (the full reference)
+
+> **The 3-second truth:** JSON is **text**. Nothing else. A JSON *string* has no methods, no objects — you must translate it into Python object first (`loads`), and translate your Python object back into a JSON string (`dumps`) before you send it. Every table below is just "translate here vs there".
+
+### Table 1 — the stdlib `json` module (the 4 verbs + 2 flags)
+
+| Call | Direction | When you use it |
+|---|---|---|
+| `json.loads(text)` | **JSON string → Python** | parsing an API response's `.text` / a Flask body / a file's content |
+| `json.dumps(obj)` | **Python → JSON string** | building a payload to send, saving a dict, logging |
+| `json.load(f)` | JSON **file → Python** | `f = open("t.json"); data = json.load(f)` |
+| `json.dump(obj, f)` | Python → JSON **file** | writing data to a `.json` file |
+| `json.dumps(obj, indent=2)` | pretty-print flag | readable dumps |
+| `json.dumps(obj, default=str)` | rescue flag | makes `datetime`/objects serializable instead of crashing |
+
+**Memory key:** `load**s**` = **l**oad **s**tring → Python object. `dump**s**` = **d**ump **s**tring ← Python object.
+
+### Table 2 — the Python ↔ JSON translation table
+
+| JSON | appears in Python as (after `loads`) |
+|---|---|
+| `{}` object | `dict` |
+| `[]` array | `list` |
+| `"text"` string | `str` |
+| `12` / `12.5` number | `int` / `float` |
+| `true` / `false` | `bool` (capitalized: `True`/`False`) |
+| `null` | `None` |
+
+**The 3 gotchas that break beginners:**
+- **tuple** → `dumps` accepts it (becomes array), but `loads` gives back a **list**, not a tuple.
+- **set** → cannot serialize at all (`TypeError`). Convert to list first.
+- **datetime** → cannot serialize (`TypeError`). Fix: `json.dumps(obj, default=str)`.
+
+### Table 3 — sending JSON with the `requests` library
+
+| Task | Code |
+|---|---|
+| POST with a JSON body | `resp = requests.post(url, json={"query": "..."})` |
+| GET with query params | `resp = requests.get(url, params={"q": "..."})` |
+| read the JSON answer | `data = resp.json()`  (now it's a dict — Table 2 rules apply) |
+| check it worked | `resp.status_code` ; `resp.raise_for_status()` (raises on 4xx/5xx) |
+| response isn't JSON | `resp.json()` → `JSONDecodeError` |
+
+**Note:** `json=` argument does two things automatically — `json.dumps()` + sets `Content-Type: application/json`. If you instead pass `data="..."` (a raw string), *nothing* is automatic: no Content-Type header, and you must make the JSON string yourself.
+
+### Table 4 — receiving JSON in Flask (server side)
+
+| Need | Code |
+|---|---|
+| get the body as a dict | `body = request.get_json()`  (`None` if body isn't JSON) |
+| send a JSON response | `from flask import jsonify` then `return jsonify({"answer": ...})` |
+| send JSON + status code | `return jsonify({"error": "..."}), 422` |
+| check a body actually IS JSON | `if request.is_json:` |
+| read a header | `token = request.headers.get("Authorization")` |
+| route values | `/mail/<msg_id>` → `def view(msg_id):` |
+| Flask's automatic rejection | non-JSON body → `415`, malformed JSON → `400` (it raises `BadRequest`) |
+
+### Table 5 — the safe pattern (exactly your law-chatbot style)
+
+| Rule | Code |
+|---|---|
+| validate BEFORE indexing | `if not body or "query" not in body: return jsonify({"error": "missing query"}), 400` |
+| wrap outside-world calls | `try: ... except Exception as e: return jsonify({"error": str(e)}), 500` |
+| never trust client types | validate/coerce every field instead of using it blindly |
+| keep the response small | `jsonify({"answer": text})`, don't echo back the whole request |
+
+**FastAPI one-liner (for later):** same idea, but your route declares a Pydantic `class Body(BaseModel): query: str` as the parameter — validation happens at the door‑frame, and returning a plain dict is converted to JSON automatically.
+
+**The 4-arrow loop (ties to section 19):** client `requests.post(json=...)` → Flask `request.get_json()` → logic → `return jsonify(...)` → client `resp.json()`. Each arrow must translate; JSONDecodeError/TypeError live exactly on those arrows.
